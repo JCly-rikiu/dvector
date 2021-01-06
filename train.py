@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--decay_every", type=int, default=100000)
     parser.add_argument("--batch_per_valid", type=int, default=10)
     parser.add_argument("--n_workers", type=int, default=cpu_count())
+    parser.add_argument("--preload", action="store_true")
     return vars(parser.parse_args())
 
 
@@ -54,6 +55,7 @@ def train(
     decay_every,
     batch_per_valid,
     n_workers,
+    preload,
 ):
     """Train a d-vector network."""
 
@@ -66,7 +68,9 @@ def train(
         metadata = json.load(f)
 
     # create data loader, iterator
-    dataset = GE2EDataset(data_dir, metadata["speakers"], n_utterances, seg_len)
+    dataset = GE2EDataset(
+        data_dir, metadata["speakers"], n_utterances, seg_len, preload
+    )
     trainset, validset = random_split(dataset, [len(dataset) - n_speakers, n_speakers])
     train_loader = DataLoader(
         trainset,
