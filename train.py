@@ -3,20 +3,23 @@
 """Train d-vector."""
 
 import json
+import os
 from argparse import ArgumentParser
-from itertools import count
-from pathlib import Path
-from multiprocessing import cpu_count
 from datetime import datetime
+from itertools import count
+from multiprocessing import cpu_count
+from pathlib import Path
 
-import tqdm
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import tqdm
 from torch.optim import SGD
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import random_split
 from torch.utils.tensorboard import SummaryWriter
 
-from data import GE2EDataset, pad_batch, MultiEpochsDataLoader
+from data import GE2EDataset, MultiEpochsDataLoader, pad_batch
 from modules import DVector, GE2ELoss
 from utils import CUDATimer
 
@@ -64,7 +67,6 @@ def train(
     start_time = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     checkpoints_path = Path(model_dir) / "checkpoints" / start_time
     checkpoints_path.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(Path(model_dir) / "logs" / start_time)
     with open(Path(data_dir, "metadata.json"), "r") as f:
         metadata = json.load(f)
 
@@ -73,6 +75,68 @@ def train(
         data_dir, metadata["speakers"], n_utterances, seg_len, preload
     )
     trainset, validset = random_split(dataset, [len(dataset) - n_speakers, n_speakers])
+    assert len(trainset) >= n_speakers
+    assert len(validset) >= n_speakers
+    print(
+        f"Training starts with {len(trainset)} speakers. "
+        f"(and {len(validset)} speakers for validation)"
+    )
+
+    # start distributed training
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    world_size = torch.cuda.device_count()
+    print(f"Use {world_size} GPUs!")
+    mp.spawn(
+        ddp_train,
+        args=(
+            world_size,
+            model_dir,
+            n_speakers,
+            n_utterances,
+            seg_len,
+            save_every,
+            valid_every,
+            decay_every,
+            batch_per_valid,
+            n_workers,
+            start_time,
+            checkpoints_path,
+            metadata,
+            trainset,
+            validset,
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+
+
+def ddp_train(
+    rank,
+    world_size,
+    model_dir,
+    n_speakers,
+    n_utterances,
+    seg_len,
+    save_every,
+    valid_every,
+    decay_every,
+    batch_per_valid,
+    n_workers,
+    start_time,
+    checkpoints_path,
+    metadata,
+    trainset,
+    validset,
+):
+    print(f"Running on rank {rank}.")
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    if rank == 0:
+        writer = SummaryWriter(Path(model_dir) / "logs" / start_time)
+    else:  # to get rid of unbound warnings
+        writer = None
+
     train_loader = MultiEpochsDataLoader(
         trainset,
         batch_size=n_speakers,
@@ -88,43 +152,45 @@ def train(
         collate_fn=pad_batch,
         drop_last=True,
     )
+
     train_iter = infinite_iterator(train_loader)
     valid_iter = infinite_iterator(valid_loader)
 
-    assert len(trainset) >= n_speakers
-    assert len(validset) >= n_speakers
-    print(
-        f"Training starts with {len(trainset)} speakers. "
-        f"(and {len(validset)} speakers for validation)"
-    )
-
     # build network and training tools
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dvector = DVector(dim_input=metadata["n_mels"], seg_len=seg_len, dim_cell=256).to(device)
-    dvector = torch.jit.script(dvector)
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    dvector = DVector(dim_input=metadata["n_mels"], seg_len=seg_len).to(device)
+    ddp_dvector = torch.nn.parallel.DistributedDataParallel(dvector, device_ids=[rank])
+
     criterion = GE2ELoss().to(device)
     optimizer = SGD(list(dvector.parameters()) + list(criterion.parameters()), lr=0.01)
     scheduler = StepLR(optimizer, step_size=decay_every, gamma=0.5)
 
-    pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
     train_losses, valid_losses = [], []
     batch_ms, model_ms, loss_ms, backward_ms = [], [], [], []
-
-    cuda_timer = CUDATimer()
+    if rank == 0:
+        pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
+        cuda_timer = CUDATimer()
+    else:  # to get rid of unbound warnings
+        pbar = None
+        cuda_timer = None
 
     # start training
     for step in count(start=1):
 
-        cuda_timer.record('batch')
+        if rank == 0:
+            cuda_timer.record("batch")
         batch = next(train_iter).to(device)
 
-        cuda_timer.record('model')
-        embds = dvector(batch).view(n_speakers, n_utterances, -1)
+        if rank == 0:
+            cuda_timer.record("model")
+        embds = ddp_dvector(batch).view(n_speakers, n_utterances, -1)
 
-        cuda_timer.record('loss')
+        if rank == 0:
+            cuda_timer.record("loss")
         loss = criterion(embds)
 
-        cuda_timer.record('backward')
+        if rank == 0:
+            cuda_timer.record("backward")
         optimizer.zero_grad()
         loss.backward()
 
@@ -141,50 +207,60 @@ def train(
         optimizer.step()
         scheduler.step()
 
-        cuda_timer.record()
-        elapsed_times = cuda_timer.stop()
+        if rank == 0:
+            cuda_timer.record()
+            elapsed_times = cuda_timer.stop()
 
-        train_losses.append(loss.item())
-        batch_ms.append(elapsed_times["batch"])
-        model_ms.append(elapsed_times["model"])
-        loss_ms.append(elapsed_times["loss"])
-        backward_ms.append(elapsed_times["backward"])
+            train_losses.append(loss.item())
+            batch_ms.append(elapsed_times["batch"])
+            model_ms.append(elapsed_times["model"])
+            loss_ms.append(elapsed_times["loss"])
+            backward_ms.append(elapsed_times["backward"])
 
-        pbar.update(1)
-        pbar.set_postfix(step=step, loss=loss.item(), grad_norm=grad_norm.item())
+            pbar.update(1)
+            pbar.set_postfix(step=step, loss=loss.item(), grad_norm=grad_norm.item())
 
-        if step % valid_every == 0:
-            pbar.close()
+            if step % valid_every == 0:
+                pbar.close()
 
-            for _ in range(batch_per_valid):
-                batch = next(valid_iter).to(device)
+                for _ in range(batch_per_valid):
+                    batch = next(valid_iter).to(device)
 
-                with torch.no_grad():
-                    embd = dvector(batch).view(n_speakers, n_utterances, -1)
-                    loss = criterion(embd)
-                    valid_losses.append(loss.item())
+                    with torch.no_grad():
+                        embd = dvector(batch).view(n_speakers, n_utterances, -1)
+                        loss = criterion(embd)
+                        valid_losses.append(loss.item())
 
-            avg_train_loss = sum(train_losses) / len(train_losses)
-            avg_valid_loss = sum(valid_losses) / len(valid_losses)
-            avg_batch_ms = sum(batch_ms) / len(batch_ms)
-            avg_model_ms = sum(model_ms) / len(model_ms)
-            avg_loss_ms = sum(loss_ms) / len(loss_ms)
-            avg_backward_ms = sum(backward_ms) / len(backward_ms)
-            print(f"Valid: loss={avg_valid_loss:.1f}, avg_batch_ms={avg_batch_ms:.3f}, avg_model_ms={avg_model_ms:.3f}, avg_loss_ms={avg_loss_ms:.3f}, avg_backward_ms={avg_backward_ms:.3f}")
+                avg_train_loss = sum(train_losses) / len(train_losses)
+                avg_valid_loss = sum(valid_losses) / len(valid_losses)
+                avg_batch_ms = sum(batch_ms) / len(batch_ms)
+                avg_model_ms = sum(model_ms) / len(model_ms)
+                avg_loss_ms = sum(loss_ms) / len(loss_ms)
+                avg_backward_ms = sum(backward_ms) / len(backward_ms)
+                print(
+                    f"Valid: loss={avg_valid_loss:.1f}, "
+                    f"avg_batch_ms={avg_batch_ms:.3f}, "
+                    f"avg_model_ms={avg_model_ms:.3f}, "
+                    f"avg_loss_ms={avg_loss_ms:.3f}, "
+                    f"avg_backward_ms={avg_backward_ms:.3f}"
+                )
 
-            writer.add_scalar("Loss/train", avg_train_loss, step)
-            writer.add_scalar("Loss/valid", avg_valid_loss, step)
+                writer.add_scalar("Loss/train", avg_train_loss, step)
+                writer.add_scalar("Loss/valid", avg_valid_loss, step)
 
-            writer.add_scalars("Elapsed_time", {"avg_batch_ms": avg_batch_ms, "avg_model_ms": avg_model_ms, "avg_loss_ms": avg_loss_ms, "avg_backward_ms": avg_backward_ms}, step)
+                writer.add_scalar("Elapsed time/batch (ms)", avg_batch_ms, step)
+                writer.add_scalar("Elapsed time/model (ms)", avg_model_ms, step)
+                writer.add_scalar("Elapsed time/loss (ms)", avg_loss_ms, step)
+                writer.add_scalar("Elapsed time/backward (ms)", avg_backward_ms, step)
 
-            pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
-            train_losses, valid_losses = [], []
+                pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
+                train_losses, valid_losses = [], []
 
-        if step % save_every == 0:
-            ckpt_path = checkpoints_path / f"dvector-step{step}.pt"
-            dvector.cpu()
-            dvector.save(str(ckpt_path))
-            dvector.to(device)
+            if step % save_every == 0:
+                ckpt_path = checkpoints_path / f"dvector-step{step}.pt"
+                torch.save(ddp_dvector, str(ckpt_path))
+
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

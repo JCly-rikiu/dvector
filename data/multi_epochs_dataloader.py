@@ -4,7 +4,6 @@ import torch
 
 
 class MultiEpochsDataLoader(torch.utils.data.DataLoader):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._DataLoader__initialized = False
@@ -21,7 +20,7 @@ class MultiEpochsDataLoader(torch.utils.data.DataLoader):
 
 
 class _RepeatSampler(object):
-    """ Sampler that repeats forever.
+    """Sampler that repeats forever.
     Args:
         sampler (Sampler)
     """
