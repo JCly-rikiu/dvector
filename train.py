@@ -13,11 +13,12 @@ import tqdm
 import torch
 from torch.optim import SGD
 from torch.optim.lr_scheduler import StepLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import random_split
 from torch.utils.tensorboard import SummaryWriter
 
-from data import GE2EDataset, pad_batch
+from data import GE2EDataset, pad_batch, MultiEpochsDataLoader
 from modules import DVector, GE2ELoss
+from utils import CUDATimer
 
 
 def parse_args():
@@ -72,7 +73,7 @@ def train(
         data_dir, metadata["speakers"], n_utterances, seg_len, preload
     )
     trainset, validset = random_split(dataset, [len(dataset) - n_speakers, n_speakers])
-    train_loader = DataLoader(
+    train_loader = MultiEpochsDataLoader(
         trainset,
         batch_size=n_speakers,
         shuffle=True,
@@ -80,7 +81,7 @@ def train(
         collate_fn=pad_batch,
         drop_last=True,
     )
-    valid_loader = DataLoader(
+    valid_loader = MultiEpochsDataLoader(
         validset,
         batch_size=n_speakers,
         num_workers=n_workers,
@@ -99,7 +100,7 @@ def train(
 
     # build network and training tools
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dvector = DVector(dim_input=metadata["n_mels"], seg_len=seg_len,).to(device)
+    dvector = DVector(dim_input=metadata["n_mels"], seg_len=seg_len, dim_cell=256).to(device)
     dvector = torch.jit.script(dvector)
     criterion = GE2ELoss().to(device)
     optimizer = SGD(list(dvector.parameters()) + list(criterion.parameters()), lr=0.01)
@@ -107,14 +108,23 @@ def train(
 
     pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
     train_losses, valid_losses = [], []
+    batch_ms, model_ms, loss_ms, backward_ms = [], [], [], []
+
+    cuda_timer = CUDATimer()
 
     # start training
     for step in count(start=1):
 
+        cuda_timer.record('batch')
         batch = next(train_iter).to(device)
+
+        cuda_timer.record('model')
         embds = dvector(batch).view(n_speakers, n_utterances, -1)
+
+        cuda_timer.record('loss')
         loss = criterion(embds)
 
+        cuda_timer.record('backward')
         optimizer.zero_grad()
         loss.backward()
 
@@ -131,7 +141,15 @@ def train(
         optimizer.step()
         scheduler.step()
 
+        cuda_timer.record()
+        elapsed_times = cuda_timer.stop()
+
         train_losses.append(loss.item())
+        batch_ms.append(elapsed_times["batch"])
+        model_ms.append(elapsed_times["model"])
+        loss_ms.append(elapsed_times["loss"])
+        backward_ms.append(elapsed_times["backward"])
+
         pbar.update(1)
         pbar.set_postfix(step=step, loss=loss.item(), grad_norm=grad_norm.item())
 
@@ -148,10 +166,16 @@ def train(
 
             avg_train_loss = sum(train_losses) / len(train_losses)
             avg_valid_loss = sum(valid_losses) / len(valid_losses)
-            print(f"Valid: loss={avg_valid_loss:.1f}")
+            avg_batch_ms = sum(batch_ms) / len(batch_ms)
+            avg_model_ms = sum(model_ms) / len(model_ms)
+            avg_loss_ms = sum(loss_ms) / len(loss_ms)
+            avg_backward_ms = sum(backward_ms) / len(backward_ms)
+            print(f"Valid: loss={avg_valid_loss:.1f}, avg_batch_ms={avg_batch_ms:.3f}, avg_model_ms={avg_model_ms:.3f}, avg_loss_ms={avg_loss_ms:.3f}, avg_backward_ms={avg_backward_ms:.3f}")
 
             writer.add_scalar("Loss/train", avg_train_loss, step)
             writer.add_scalar("Loss/valid", avg_valid_loss, step)
+
+            writer.add_scalars("Elapsed_time", {"avg_batch_ms": avg_batch_ms, "avg_model_ms": avg_model_ms, "avg_loss_ms": avg_loss_ms, "avg_backward_ms": avg_backward_ms}, step)
 
             pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
             train_losses, valid_losses = [], []
