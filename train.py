@@ -14,9 +14,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import tqdm
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import random_split
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from data import GE2EDataset, MultiEpochsDataLoader, pad_batch
@@ -41,9 +43,11 @@ def parse_args():
     return vars(parser.parse_args())
 
 
-def infinite_iterator(dataloader):
+def infinite_iterator(dataloader, sampler=None):
     """Infinitely yield a batch of data."""
-    while True:
+    for epoch in count():
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         for batch in iter(dataloader):
             yield batch
 
@@ -137,10 +141,11 @@ def ddp_train(
     else:  # to get rid of unbound warnings
         writer = None
 
+    train_sampler = DistributedSampler(trainset)
     train_loader = MultiEpochsDataLoader(
         trainset,
         batch_size=n_speakers,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=n_workers,
         collate_fn=pad_batch,
         drop_last=True,
@@ -153,16 +158,17 @@ def ddp_train(
         drop_last=True,
     )
 
-    train_iter = infinite_iterator(train_loader)
+    train_iter = infinite_iterator(train_loader, train_sampler)
     valid_iter = infinite_iterator(valid_loader)
 
     # build network and training tools
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     dvector = DVector(dim_input=metadata["n_mels"], seg_len=seg_len).to(device)
-    ddp_dvector = torch.nn.parallel.DistributedDataParallel(dvector, device_ids=[rank])
+    ddp_dvector = DDP(dvector, device_ids=[rank])
 
     criterion = GE2ELoss().to(device)
-    optimizer = SGD(list(dvector.parameters()) + list(criterion.parameters()), lr=0.01)
+    ddp_criterion = DDP(criterion, device_ids=[rank])
+    optimizer = SGD(list(ddp_dvector.parameters()) + list(ddp_criterion.parameters()), lr=0.01)
     scheduler = StepLR(optimizer, step_size=decay_every, gamma=0.5)
 
     train_losses, valid_losses = [], []
@@ -187,7 +193,7 @@ def ddp_train(
 
         if rank == 0:
             cuda_timer.record("loss")
-        loss = criterion(embds)
+        loss = ddp_criterion(embds)
 
         if rank == 0:
             cuda_timer.record("backward")
@@ -227,8 +233,8 @@ def ddp_train(
                     batch = next(valid_iter).to(device)
 
                     with torch.no_grad():
-                        embd = dvector(batch).view(n_speakers, n_utterances, -1)
-                        loss = criterion(embd)
+                        embd = ddp_dvector(batch).view(n_speakers, n_utterances, -1)
+                        loss = ddp_criterion(embd)
                         valid_losses.append(loss.item())
 
                 avg_train_loss = sum(train_losses) / len(train_losses)
@@ -252,6 +258,7 @@ def ddp_train(
                 writer.add_scalar("Elapsed time/model (ms)", avg_model_ms, step)
                 writer.add_scalar("Elapsed time/loss (ms)", avg_loss_ms, step)
                 writer.add_scalar("Elapsed time/backward (ms)", avg_backward_ms, step)
+                writer.flush()
 
                 pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
                 train_losses, valid_losses = [], []
