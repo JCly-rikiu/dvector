@@ -13,13 +13,13 @@ from tempfile import NamedTemporaryFile
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import tqdm
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import random_split
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from data import GE2EDataset, MultiEpochsDataLoader, pad_batch
 from modules import DVector, GE2ELoss
@@ -141,11 +141,6 @@ def ddp_train(
         store=dist.FileStore(tmp_file_path, world_size),
     )
 
-    if rank == 0:
-        writer = SummaryWriter(Path(model_dir) / "logs" / start_time)
-    else:  # to get rid of unbound warnings
-        writer = None
-
     train_sampler = DistributedSampler(trainset)
     train_loader = MultiEpochsDataLoader(
         trainset,
@@ -155,42 +150,44 @@ def ddp_train(
         collate_fn=pad_batch,
         drop_last=True,
     )
-    valid_loader = MultiEpochsDataLoader(
-        validset,
-        batch_size=n_speakers,
-        num_workers=n_workers,
-        collate_fn=pad_batch,
-        drop_last=True,
-    )
-
     train_iter = infinite_iterator(train_loader, train_sampler)
-    valid_iter = infinite_iterator(valid_loader)
 
     # build network and training tools
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    dvector = DVector(dim_input=metadata["n_mels"], seg_len=seg_len).to(device)
+    dvector = DVector(dim_input=metadata["n_mels"], seg_len=seg_len).to(rank)
     ddp_dvector = DDP(dvector, device_ids=[rank])
 
-    criterion = GE2ELoss().to(device)
+    criterion = GE2ELoss().to(rank)
     ddp_criterion = DDP(criterion, device_ids=[rank])
-    optimizer = SGD(list(ddp_dvector.parameters()) + list(ddp_criterion.parameters()), lr=0.01)
+    optimizer = SGD(
+        list(ddp_dvector.parameters()) + list(ddp_criterion.parameters()), lr=0.01
+    )
     scheduler = StepLR(optimizer, step_size=decay_every, gamma=0.5)
 
     train_losses, valid_losses = [], []
     batch_ms, model_ms, loss_ms, backward_ms = [], [], [], []
+
     if rank == 0:
-        pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
+        writer = SummaryWriter(Path(model_dir) / "logs" / start_time)
+        valid_loader = MultiEpochsDataLoader(
+            validset,
+            batch_size=n_speakers,
+            num_workers=n_workers,
+            collate_fn=pad_batch,
+            drop_last=True,
+        )
+        valid_iter = infinite_iterator(valid_loader)
+        pbar = tqdm(total=valid_every, ncols=0, desc="Train")
         cuda_timer = CUDATimer()
-    else:  # to get rid of unbound warnings
-        pbar = None
-        cuda_timer = None
+    else:
+        valid_loader, valid_iter, writer = None, None, None
+        pbar, cuda_timer = None, None
 
     # start training
     for step in count(start=1):
 
         if rank == 0:
             cuda_timer.record("batch")
-        batch = next(train_iter).to(device)
+        batch = next(train_iter).to(rank)
 
         if rank == 0:
             cuda_timer.record("model")
@@ -206,7 +203,7 @@ def ddp_train(
         loss.backward()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(dvector.parameters()) + list(criterion.parameters()),
+            list(ddp_dvector.parameters()) + list(ddp_criterion.parameters()),
             max_norm=3,
             norm_type=2.0,
         )
@@ -235,7 +232,7 @@ def ddp_train(
                 pbar.close()
 
                 for _ in range(batch_per_valid):
-                    batch = next(valid_iter).to(device)
+                    batch = next(valid_iter).to(rank)
 
                     with torch.no_grad():
                         embd = ddp_dvector(batch).view(n_speakers, n_utterances, -1)
@@ -266,7 +263,7 @@ def ddp_train(
                 writer.add_scalar("Elapsed time/backward (ms)", avg_backward_ms, step)
                 writer.flush()
 
-                pbar = tqdm.tqdm(
+                pbar = tqdm(
                     total=step + valid_every, ncols=0, initial=step, desc="Train",
                 )
                 train_losses, valid_losses = [], []
