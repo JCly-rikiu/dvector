@@ -13,6 +13,7 @@ from tempfile import NamedTemporaryFile
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from diffdist.functional import all_gather
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD
 from torch.optim.lr_scheduler import StepLR
@@ -84,9 +85,13 @@ def train(
     print(f"[TRAIN] Use {len(trainset)} speakers for training.")
     print(f"[TRAIN] Use {len(validset)} speakers for validation.")
 
-    # start distributed training
+    # setup distributed training
     world_size = torch.cuda.device_count()
     print(f"[TRAIN] Use {world_size} GPUs!")
+    ddp_batch_sizes = [n_speakers // world_size] * world_size
+    ddp_batch_sizes[0] += n_speakers % world_size
+
+    # start distributed training
     tmp_file = NamedTemporaryFile()
     print(f"[TRAIN] Use {tmp_file.name} as FileStore.")
     mp.spawn(
@@ -108,6 +113,7 @@ def train(
             metadata,
             trainset,
             validset,
+            ddp_batch_sizes,
         ),
         nprocs=world_size,
         join=True,
@@ -132,6 +138,7 @@ def ddp_train(
     metadata,
     trainset,
     validset,
+    ddp_batch_sizes,
 ):
     print(f"[DDP] Running on rank {rank}.")
     dist.init_process_group(
@@ -141,10 +148,12 @@ def ddp_train(
         store=dist.FileStore(tmp_file_path, world_size),
     )
 
+    ddp_batch_size = ddp_batch_sizes[rank]
+
     train_sampler = DistributedSampler(trainset)
     train_loader = MultiEpochsDataLoader(
         trainset,
-        batch_size=n_speakers,
+        batch_size=ddp_batch_size,
         sampler=train_sampler,
         num_workers=n_workers,
         collate_fn=pad_batch,
@@ -191,10 +200,17 @@ def ddp_train(
 
         if rank == 0:
             cuda_timer.record("model")
-        embds = ddp_dvector(batch).view(n_speakers, n_utterances, -1)
+        embds = ddp_dvector(batch).view(ddp_batch_size, n_utterances, -1)
 
         if rank == 0:
             cuda_timer.record("loss")
+
+        all_embds = [
+            torch.empty(ddp_bs, embds.size(1), embds.size(2)).to(rank)
+            for ddp_bs in ddp_batch_sizes
+        ]
+        all_embds = all_gather(all_embds, embds)
+        embds = torch.cat(all_embds, 0)
         loss = ddp_criterion(embds)
 
         if rank == 0:
