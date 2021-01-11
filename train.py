@@ -3,12 +3,12 @@
 """Train d-vector."""
 
 import json
-import os
 from argparse import ArgumentParser
 from datetime import datetime
 from itertools import count
 from multiprocessing import cpu_count
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import torch
 import torch.distributed as dist
@@ -81,20 +81,19 @@ def train(
     trainset, validset = random_split(dataset, [len(dataset) - n_speakers, n_speakers])
     assert len(trainset) >= n_speakers
     assert len(validset) >= n_speakers
-    print(
-        f"Training starts with {len(trainset)} speakers. "
-        f"(and {len(validset)} speakers for validation)"
-    )
+    print(f"[TRAIN] Use {len(trainset)} speakers for training.")
+    print(f"[TRAIN] Use {len(validset)} speakers for validation.")
 
     # start distributed training
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
     world_size = torch.cuda.device_count()
-    print(f"Use {world_size} GPUs!")
+    print(f"[TRAIN] Use {world_size} GPUs!")
+    tmp_file = NamedTemporaryFile()
+    print(f"[TRAIN] Use {tmp_file.name} as FileStore.")
     mp.spawn(
         ddp_train,
         args=(
             world_size,
+            tmp_file.name,
             model_dir,
             n_speakers,
             n_utterances,
@@ -118,6 +117,7 @@ def train(
 def ddp_train(
     rank,
     world_size,
+    tmp_file_path,
     model_dir,
     n_speakers,
     n_utterances,
@@ -133,8 +133,13 @@ def ddp_train(
     trainset,
     validset,
 ):
-    print(f"Running on rank {rank}.")
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    print(f"[DDP] Running on rank {rank}.")
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        store=dist.FileStore(tmp_file_path, world_size),
+    )
 
     if rank == 0:
         writer = SummaryWriter(Path(model_dir) / "logs" / start_time)
@@ -224,7 +229,7 @@ def ddp_train(
             backward_ms.append(elapsed_times["backward"])
 
             pbar.update(1)
-            pbar.set_postfix(step=step, loss=loss.item(), grad_norm=grad_norm.item())
+            pbar.set_postfix(loss=loss.item(), grad_norm=grad_norm.item())
 
             if step % valid_every == 0:
                 pbar.close()
@@ -243,12 +248,13 @@ def ddp_train(
                 avg_model_ms = sum(model_ms) / len(model_ms)
                 avg_loss_ms = sum(loss_ms) / len(loss_ms)
                 avg_backward_ms = sum(backward_ms) / len(backward_ms)
+                print(f"[DDP] Valid: loss={avg_valid_loss:.1f}, ")
                 print(
-                    f"Valid: loss={avg_valid_loss:.1f}, "
-                    f"avg_batch_ms={avg_batch_ms:.3f}, "
-                    f"avg_model_ms={avg_model_ms:.3f}, "
-                    f"avg_loss_ms={avg_loss_ms:.3f}, "
-                    f"avg_backward_ms={avg_backward_ms:.3f}"
+                    f"[DDP] Average elapsed time: "
+                    f"batch {avg_batch_ms:.1f} ms, "
+                    f"model {avg_model_ms:.1f} ms, "
+                    f"loss {avg_loss_ms:.1f} ms, "
+                    f"backward {avg_backward_ms:.1f} ms"
                 )
 
                 writer.add_scalar("Loss/train", avg_train_loss, step)
@@ -260,7 +266,9 @@ def ddp_train(
                 writer.add_scalar("Elapsed time/backward (ms)", avg_backward_ms, step)
                 writer.flush()
 
-                pbar = tqdm.tqdm(total=valid_every, ncols=0, desc="Train")
+                pbar = tqdm.tqdm(
+                    total=step + valid_every, ncols=0, initial=step, desc="Train",
+                )
                 train_losses, valid_losses = [], []
 
             if step % save_every == 0:
